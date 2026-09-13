@@ -147,6 +147,7 @@ fn run_stats(args: &[String]) -> Result<ExitCode, Error> {
     let mut fields: Vec<FieldPath> = Vec::new();
     let mut top: usize = 10;
     let mut max_errors: usize = 10;
+    let mut json = false;
     let mut file_arg: Option<&str> = None;
 
     let mut i = 0;
@@ -179,6 +180,7 @@ fn run_stats(args: &[String]) -> Result<ExitCode, Error> {
                     Error::Usage(format!("invalid value for --max-errors: '{value}'"))
                 })?;
             }
+            "--json" => json = true,
             other if file_arg.is_none() => file_arg = Some(other),
             other => return Err(Error::Usage(format!("unexpected argument '{other}'"))),
         }
@@ -194,7 +196,12 @@ fn run_stats(args: &[String]) -> Result<ExitCode, Error> {
     let stats = Stats::from_reader(io::BufReader::new(input), options)
         .map_err(|e| Error::Runtime(format!("read error: {e}")))?;
 
-    print_stats(file_arg.unwrap_or("-"), &stats, top);
+    let file_label = file_arg.unwrap_or("-");
+    if json {
+        println!("{}", stats_to_json(file_label, &stats, top));
+    } else {
+        print_stats(file_label, &stats, top);
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -310,6 +317,230 @@ fn print_stats(file_label: &str, stats: &Stats, top: usize) {
     }
 }
 
+/// Builds the `--json` report for `stats`. Kept separate from `print_stats`
+/// rather than folded into it: the two have almost no formatting in common
+/// once you account for indentation and trailing commas, and a shared
+/// function would just be a branch on `json` at every line.
+fn stats_to_json(file_label: &str, stats: &Stats, top: usize) -> String {
+    let mut fields = vec![
+        ("file".to_string(), json_string(file_label)),
+        ("lines".to_string(), stats.lines.to_string()),
+        ("blank".to_string(), stats.blank.to_string()),
+        ("invalid".to_string(), stats.invalid.to_string()),
+        ("valid".to_string(), stats.valid.to_string()),
+        ("bytes".to_string(), stats.bytes.to_string()),
+        ("top_level".to_string(), json_type_tally(&stats.top_level)),
+        (
+            "line_length".to_string(),
+            json_object(vec![
+                ("min".to_string(), stats.line_length.min().to_string()),
+                (
+                    "p50".to_string(),
+                    stats.line_length.percentile(0.5).to_string(),
+                ),
+                (
+                    "p90".to_string(),
+                    stats.line_length.percentile(0.9).to_string(),
+                ),
+                (
+                    "p99".to_string(),
+                    stats.line_length.percentile(0.99).to_string(),
+                ),
+                ("max".to_string(), stats.line_length.max().to_string()),
+                ("mean".to_string(), json_number(stats.line_length.mean())),
+            ]),
+        ),
+    ];
+
+    let mut keys: Vec<_> = stats.keys.iter().collect();
+    keys.sort_by(|a, b| b.count.cmp(&a.count));
+    let key_items: Vec<String> = keys
+        .iter()
+        .map(|key| {
+            json_object(vec![
+                ("key".to_string(), json_string(&key.key)),
+                ("count".to_string(), key.count.to_string()),
+                (
+                    "rate".to_string(),
+                    json_number(rate(key.count, stats.valid)),
+                ),
+                ("types".to_string(), json_type_tally(&key.types)),
+            ])
+        })
+        .collect();
+    fields.push(("keys".to_string(), json_array(key_items)));
+    fields.push((
+        "keys_truncated".to_string(),
+        stats.keys_truncated.to_string(),
+    ));
+
+    let field_items: Vec<String> = stats
+        .fields
+        .iter()
+        .map(|field| {
+            let top_items: Vec<String> = field
+                .top(top)
+                .into_iter()
+                .map(|(value, count)| {
+                    json_object(vec![
+                        ("value".to_string(), json_string(&value)),
+                        ("count".to_string(), count.to_string()),
+                        ("rate".to_string(), json_number(rate(count, field.values))),
+                    ])
+                })
+                .collect();
+            json_object(vec![
+                ("path".to_string(), json_string(&field.path.to_string())),
+                (
+                    "records_present".to_string(),
+                    field.records_present.to_string(),
+                ),
+                (
+                    "rate".to_string(),
+                    json_number(rate(field.records_present, stats.valid)),
+                ),
+                ("values".to_string(), field.values.to_string()),
+                ("types".to_string(), json_type_tally(&field.types)),
+                (
+                    "distinct_values".to_string(),
+                    field.distinct_values().to_string(),
+                ),
+                (
+                    "values_truncated".to_string(),
+                    field.values_truncated.to_string(),
+                ),
+                ("top".to_string(), json_array(top_items)),
+            ])
+        })
+        .collect();
+    fields.push(("fields".to_string(), json_array(field_items)));
+
+    let issue_items: Vec<String> = stats
+        .issues
+        .iter()
+        .map(|issue| {
+            json_object(vec![
+                ("line".to_string(), issue.line.to_string()),
+                ("column".to_string(), issue.column.to_string()),
+                ("reason".to_string(), json_string(&issue.reason)),
+            ])
+        })
+        .collect();
+    fields.push(("issues".to_string(), json_array(issue_items)));
+    fields.push((
+        "issues_truncated".to_string(),
+        (stats.invalid > stats.issues.len()).to_string(),
+    ));
+
+    json_object(fields)
+}
+
+fn rate(n: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        n as f64 / total as f64
+    }
+}
+
+fn json_type_tally(tally: &jsonl_peek::stats::TypeTally) -> String {
+    let entries: Vec<(String, String)> = tally
+        .sorted()
+        .into_iter()
+        .map(|(name, count)| (name.to_string(), count.to_string()))
+        .collect();
+    json_object(entries)
+}
+
+/// Renders an ordered set of key/value pairs as a JSON object, with the
+/// already-rendered `value` text indented to sit correctly under `key` no
+/// matter how many lines it spans. Values are pre-rendered strings so
+/// `stats_to_json` can build nested objects/arrays bottom-up rather than
+/// needing a `Value`-like tree just for this one report.
+fn json_object(fields: Vec<(String, String)>) -> String {
+    if fields.is_empty() {
+        return "{}".to_string();
+    }
+    let mut out = String::from("{\n");
+    for (i, (key, value)) in fields.iter().enumerate() {
+        out.push_str("  ");
+        out.push_str(&json_string(key));
+        out.push_str(": ");
+        out.push_str(&indent_continuation(value));
+        if i + 1 < fields.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push('}');
+    out
+}
+
+fn json_array(items: Vec<String>) -> String {
+    if items.is_empty() {
+        return "[]".to_string();
+    }
+    let mut out = String::from("[\n");
+    for (i, item) in items.iter().enumerate() {
+        out.push_str("  ");
+        out.push_str(&indent_continuation(item));
+        if i + 1 < items.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push(']');
+    out
+}
+
+/// Indents every line after the first by two spaces, so a multi-line nested
+/// object or array lines up under the key or bracket that introduces it.
+fn indent_continuation(text: &str) -> String {
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let mut out = first.to_string();
+    for line in lines {
+        out.push('\n');
+        out.push_str("  ");
+        out.push_str(line);
+    }
+    out
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Formats an `f64` for JSON output, trimmed to 4 decimal places with
+/// trailing zeros (and a bare trailing `.`) removed so whole numbers read as
+/// `5`, not `5.0000`.
+fn json_number(v: f64) -> String {
+    let s = format!("{v:.4}");
+    let s = s.trim_end_matches('0');
+    let s = s.trim_end_matches('.');
+    if s.is_empty() || s == "-" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 fn format_count(n: u64) -> String {
     let digits = n.to_string();
     let bytes = digits.as_bytes();
@@ -366,5 +597,67 @@ fn open_input(file_arg: Option<&str>) -> Result<Box<dyn Read>, Error> {
         Some(path) => File::open(path)
             .map(|f| Box::new(f) as Box<dyn Read>)
             .map_err(|e| Error::Runtime(format!("cannot open '{path}': {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn json_string_escapes_control_characters_and_quotes() {
+        assert_eq!(json_string("hi"), "\"hi\"");
+        assert_eq!(json_string("a\"b"), "\"a\\\"b\"");
+        assert_eq!(json_string("a\\b"), "\"a\\\\b\"");
+        assert_eq!(json_string("a\nb\tc"), "\"a\\nb\\tc\"");
+        assert_eq!(json_string("a\u{1}b"), "\"a\\u0001b\"");
+    }
+
+    #[test]
+    fn json_number_trims_trailing_zeros() {
+        assert_eq!(json_number(0.0), "0");
+        assert_eq!(json_number(5.0), "5");
+        assert_eq!(json_number(0.5), "0.5");
+        assert_eq!(json_number(466.9226), "466.9226");
+        assert_eq!(json_number(1.0 / 3.0), "0.3333");
+    }
+
+    #[test]
+    fn json_object_indents_nested_values() {
+        let inner = json_object(vec![("b".to_string(), "1".to_string())]);
+        let outer = json_object(vec![("a".to_string(), inner)]);
+        assert_eq!(outer, "{\n  \"a\": {\n    \"b\": 1\n  }\n}");
+    }
+
+    #[test]
+    fn json_array_indents_nested_objects() {
+        let item = json_object(vec![("k".to_string(), "1".to_string())]);
+        let arr = json_array(vec![item.clone(), item]);
+        assert_eq!(
+            arr,
+            "[\n  {\n    \"k\": 1\n  },\n  {\n    \"k\": 1\n  }\n]"
+        );
+    }
+
+    #[test]
+    fn stats_to_json_produces_parseable_numbers_and_the_field_path() {
+        let path = FieldPath::parse("meta.source").unwrap();
+        let options = StatsOptions {
+            fields: vec![path],
+            ..StatsOptions::default()
+        };
+        let stats = Stats::from_reader(
+            Cursor::new("{\"meta\":{\"source\":\"web\"}}\n{bad}\n".as_bytes()),
+            options,
+        )
+        .unwrap();
+
+        let json = stats_to_json("sample.jsonl", &stats, 10);
+        assert!(json.contains("\"file\": \"sample.jsonl\""));
+        assert!(json.contains("\"lines\": 2"));
+        assert!(json.contains("\"invalid\": 1"));
+        assert!(json.contains("\"path\": \"meta.source\""));
+        assert!(json.contains("\"value\": \"\\\"web\\\"\""));
     }
 }
