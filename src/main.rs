@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use jsonl_peek::lines::LineReader;
 use jsonl_peek::path::FieldPath;
 use jsonl_peek::rng::Reservoir;
+use jsonl_peek::schema::{Schema, SchemaOptions};
 use jsonl_peek::stats::{Stats, StatsOptions};
 
 enum Error {
@@ -38,6 +39,7 @@ fn run(args: &[String]) -> Result<ExitCode, Error> {
         "head" => run_head(rest),
         "sample" => run_sample(rest),
         "stats" => run_stats(rest),
+        "schema" => run_schema(rest),
         other => Err(Error::Usage(format!("unknown command '{other}'"))),
     }
 }
@@ -314,6 +316,82 @@ fn print_stats(file_label: &str, stats: &Stats, top: usize) {
         for issue in &stats.issues {
             println!("  line {} col {}: {}", issue.line, issue.column, issue.reason);
         }
+    }
+}
+
+fn run_schema(args: &[String]) -> Result<ExitCode, Error> {
+    let mut depth: usize = 3;
+    let mut min_rate: f64 = 0.0;
+    let mut file_arg: Option<&str> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--depth" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| Error::Usage("--depth requires a value".into()))?;
+                depth = value
+                    .parse()
+                    .map_err(|_| Error::Usage(format!("invalid value for --depth: '{value}'")))?;
+            }
+            "--min-rate" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| Error::Usage("--min-rate requires a value".into()))?;
+                min_rate = value.parse().map_err(|_| {
+                    Error::Usage(format!("invalid value for --min-rate: '{value}'"))
+                })?;
+            }
+            other if file_arg.is_none() => file_arg = Some(other),
+            other => return Err(Error::Usage(format!("unexpected argument '{other}'"))),
+        }
+        i += 1;
+    }
+
+    let input = open_input(file_arg)?;
+    let options = SchemaOptions { depth, min_rate };
+    let schema = Schema::from_reader(io::BufReader::new(input), options)
+        .map_err(|e| Error::Runtime(format!("read error: {e}")))?;
+
+    print_schema(&schema);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_schema(schema: &Schema) {
+    println!(
+        "{} records, depth {}",
+        format_count(schema.records as u64),
+        schema.depth
+    );
+    println!();
+    println!("  {:<30} {:>7}  {}", "path", "rate", "types");
+    for path in &schema.paths {
+        let types: Vec<String> = path
+            .types
+            .sorted()
+            .into_iter()
+            .map(|(name, count)| format!("{name}:{}", format_count(count as u64)))
+            .collect();
+        println!(
+            "  {:<30} {:>7}  {}",
+            path.path,
+            percent(path.records_present, schema.records),
+            types.join(" ")
+        );
+    }
+    if schema.paths_truncated {
+        println!("  (path table limit reached, more paths were seen)");
+    }
+
+    if schema.unparseable > 0 {
+        println!();
+        println!(
+            "{} unparseable lines skipped",
+            format_count(schema.unparseable as u64)
+        );
     }
 }
 
